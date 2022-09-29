@@ -160,25 +160,33 @@ struct dm_integrity_c {
 	struct dm_dev *dev;
 	struct dm_dev *meta_dev;
 	unsigned tag_size;
+	// 2冪でないとき -1 が設定される
 	__s8 log2_tag_size;
 	sector_t start;
 	mempool_t journal_io_mempool;
+	// sync_rw_sb と rw_journal_sectors と copy_from_journal と integrity_recalc で使われる dm_io のクライアント
 	struct dm_io_client *io;
+	// チェックサムの読み書きをする非同期 I/O
 	struct dm_bufio_client *bufio;
 	struct workqueue_struct *metadata_wq;
 	struct superblock *sb;
 	unsigned journal_pages;
 	unsigned n_bitmap_blocks;
 
+	// bitmap mode のときは buffered IO するのに使われるバッファとして使われる
 	struct page_list *journal;
 	struct page_list *journal_io;
 	struct page_list *journal_xor;
 	struct page_list *recalc_bitmap;
+	// bitmap がセットされているかどうか判別するのに使われる領域
+	// page_list は連結リストでかつ配列として持っている。
+	// 仮想メモリの考慮など難しいことをしているが、これに関しては別に難しいことをしなくても普通に配列として取ってもよかった気がする
 	struct page_list *may_write_bitmap;
 	struct bitmap_block_status *bbs;
 	unsigned bitmap_flush_interval;
 	int synchronous_mode;
 	struct bio_list synchronous_bios;
+	// bitmap_flush_work() が呼び出される
 	struct delayed_work bitmap_flush_work;
 
 	struct crypto_skcipher *journal_crypt;
@@ -191,6 +199,7 @@ struct dm_integrity_c {
 	struct journal_node *journal_tree;
 	struct rb_root journal_tree_root;
 
+	// meta_dev != NULL の場合は data_device_sectors
 	sector_t provided_data_sectors;
 
 	unsigned short journal_entry_size;
@@ -201,11 +210,16 @@ struct dm_integrity_c {
 	unsigned journal_entries;
 	sector_t data_device_sectors;
 	sector_t meta_device_sectors;
+	// スーパーブロック + ビットマップ用に確保している領域の長さ
+	// この位置からチェックサムが始まる
 	unsigned initial_sectors;
 	unsigned metadata_run;
+	// meta_dev != NULL の場合は 0 になる
 	__s8 log2_metadata_run;
 	__u8 log2_buffer_sectors;
+	// チェックサム1つがデータセクタ何個分に相当するか
 	__u8 sectors_per_block;
+	// ビットマップの1ビットがチェックサム何個分に相当するか
 	__u8 log2_blocks_per_bitmap_bit;
 
 	unsigned char mode;
@@ -221,6 +235,7 @@ struct dm_integrity_c {
 	struct list_head wait_list;
 	wait_queue_head_t endio_wait;
 	struct workqueue_struct *wait_wq;
+	// 呼び出されるのは integrity_bio_wait (dm_integrity_map_continue) のみ
 	struct workqueue_struct *offload_wq;
 
 	unsigned char commit_seq;
@@ -238,10 +253,14 @@ struct dm_integrity_c {
 
 	unsigned free_sectors_threshold;
 
+	// integrity_commit() と bitmap_flush_work() が呼ばれる
 	struct workqueue_struct *commit_wq;
+	// integrity_commit() が呼ばれる
 	struct work_struct commit_work;
 
 	struct workqueue_struct *writer_wq;
+	// integrity_writer() を呼ぶ
+	// 呼ばれるのは mode == 'J' のときだけ
 	struct work_struct writer_work;
 
 	struct workqueue_struct *recalc_wq;
@@ -295,14 +314,18 @@ struct dm_integrity_io {
 
 	struct dm_integrity_c *ic;
 	enum req_opf op;
+	// dio->op == REQ_OP_WRITE && bio->bi_opf & REQ_FUA
 	bool fua;
 
 	struct dm_integrity_range range;
 
+	// チェックサムの書き込み位置。get_metadata_sector_and_offset() で計算される
 	sector_t metadata_block;
 	unsigned metadata_offset;
 
+	// 同じ名前の変数が journal_completion にもあるので紛らわしいが dm_integrity_map_continue と dec_in_flight でしか使われていない
 	atomic_t in_flight;
+	// 基本的に 0 でエラーが起きると errno_to_blk_status(r) が設定される
 	blk_status_t bi_status;
 
 	struct completion *completion;
@@ -322,9 +345,12 @@ struct journal_io {
 };
 
 struct bitmap_block_status {
+	// bitmap_block_work が割り当てられる
 	struct work_struct work;
 	struct dm_integrity_c *ic;
+	// 何番目の bitmap block か
 	unsigned idx;
+	// ic->journal が割り当てられている。よく分からない
 	unsigned long *bitmap;
 	struct bio_list bio_queue;
 	spinlock_t bio_queue_lock;
@@ -415,6 +441,11 @@ static commit_id_t dm_integrity_commit_id(struct dm_integrity_c *ic, unsigned i,
 	return ic->commit_ids[seq] ^ cpu_to_le64(((__u64)i << 32) ^ j);
 }
 
+// data_sector から該当する area と area 内の offset を求める。
+// meta_dev モードでない場合はタグ領域とデータ領域が交互に並ぶようなデータフォーマットになる。
+// タグ領域とデータ領域の一組を area と呼び、ひとつの area に含まれるデータ領域のセクタ数を --interleave-sectors で渡している。
+// つまり data_sector / interleave_sectors で何番目の area なのか分かるし、data_sector % interleave_sectors で area 内の何番目のセクタなのか (offset) が分かる。
+// ちなみにこれは meta_dev モードでない場合の話で、meta_dev モードでは area = 0, offset = data_sector である。
 static void get_area_and_offset(struct dm_integrity_c *ic, sector_t data_sector,
 				sector_t *area, sector_t *offset)
 {
@@ -434,23 +465,35 @@ do {									\
 	(n) >>= (ic)->sb->log2_sectors_per_block;			\
 } while (0)
 
+// area と offset からチェックサムが書かれる sector と offset を求める
+// ただしここでいう sector と offset はセクタサイズを buffer_sectors * 512 として数える
 static __u64 get_metadata_sector_and_offset(struct dm_integrity_c *ic, sector_t area,
 					    sector_t offset, unsigned *metadata_offset)
 {
+	// area に該当するセクタ
 	__u64 ms;
+	// metadata_offset として返される
 	unsigned mo;
-
+	
+	// ひとつの area に含まれるセクタ数が --interleave-sectors で渡されるので単純に掛け算すればよい
 	ms = area << ic->sb->log2_interleave_sectors;
+	// meta_dev != NULL の場合は 0 になる
 	if (likely(ic->log2_metadata_run >= 0))
 		ms += area << ic->log2_metadata_run;
 	else
 		ms += area * ic->metadata_run;
 	ms >>= ic->log2_buffer_sectors;
+	// ここの時点で ms = 0（area = 0 なので）
 
+	// offset /= ic->sectors_per_block
 	sector_to_block(ic, offset);
+	// ここの時点で offset = data_sector / sectors_per_block
 
+	// tag_size が2冪でないとき -1 になる
 	if (likely(ic->log2_tag_size >= 0)) {
+		// ms = (offset * tag_size) / (buffer_sectors * 512)
 		ms += offset >> (SECTOR_SHIFT + ic->log2_buffer_sectors - ic->log2_tag_size);
+		// mo = (offset * tag_size) % (buffer_sectors * 512)
 		mo = (offset << ic->log2_tag_size) & ((1U << SECTOR_SHIFT << ic->log2_buffer_sectors) - 1);
 	} else {
 		ms += (__u64)offset * ic->tag_size >> (SECTOR_SHIFT + ic->log2_buffer_sectors);
@@ -460,6 +503,8 @@ static __u64 get_metadata_sector_and_offset(struct dm_integrity_c *ic, sector_t 
 	return ms;
 }
 
+// area と offset からデータが書かれるセクタを求める
+// meta_dev の場合はただの offset になる
 static sector_t get_data_sector(struct dm_integrity_c *ic, sector_t area, sector_t offset)
 {
 	sector_t result;
@@ -546,6 +591,8 @@ static int sb_mac(struct dm_integrity_c *ic, bool wr)
 	return 0;
 }
 
+// スーパーブロックに対して ic->sb を読み書きをする
+// 同期書き込み
 static int sync_rw_sb(struct dm_integrity_c *ic, int op, int op_flags)
 {
 	struct dm_io_request io_req;
@@ -586,11 +633,18 @@ static int sync_rw_sb(struct dm_integrity_c *ic, int op, int op_flags)
 	return 0;
 }
 
+// ここの使用箇所を調べたらだいたい必要なことが分かるのでは？
+// SET されていないビットが一つでもあれば false
 #define BITMAP_OP_TEST_ALL_SET		0
+// CLEAR されていないビットが一つでもあれば false
 #define BITMAP_OP_TEST_ALL_CLEAR	1
+// SET する
 #define BITMAP_OP_SET			2
+// CLEAR する
 #define BITMAP_OP_CLEAR			3
 
+// 引数で与えられた struct page_list *bitmap に対して SET したり CLEAR したりする
+// bitmap は ic->may_write_bitmap, ic->recalc_bitmap, ic->journal が使い分けられている
 static bool block_bitmap_op(struct dm_integrity_c *ic, struct page_list *bitmap,
 			    sector_t sector, sector_t n_sectors, int mode)
 {
@@ -610,10 +664,13 @@ static bool block_bitmap_op(struct dm_integrity_c *ic, struct page_list *bitmap,
 	if (unlikely(!n_sectors))
 		return true;
 
+	// sector / (sectors_per_block * blocks_per_bitmap_bit) でセクタが対応する bit のインデックスを求める
 	bit = sector >> (ic->sb->log2_sectors_per_block + ic->log2_blocks_per_bitmap_bit);
+	// (a+b-1)/b をしているわけではない。単に右端のセクタの対応 bit を求めているだけ
 	end_bit = (sector + n_sectors - 1) >>
 		(ic->sb->log2_sectors_per_block + ic->log2_blocks_per_bitmap_bit);
 
+	// メモリに書いて buffered IO したい
 	page = bit / (PAGE_SIZE * 8);
 	bit %= PAGE_SIZE * 8;
 
@@ -631,6 +688,7 @@ repeat:
 
 	if (mode == BITMAP_OP_TEST_ALL_SET) {
 		while (bit <= this_end_bit) {
+
 			if (!(bit % BITS_PER_LONG) && this_end_bit >= bit + BITS_PER_LONG - 1) {
 				do {
 					if (data[bit / BITS_PER_LONG] != -1)
@@ -696,6 +754,7 @@ repeat:
 	return true;
 }
 
+// dst に src をコピーする
 static void block_bitmap_copy(struct dm_integrity_c *ic, struct page_list *dst, struct page_list *src)
 {
 	unsigned n_bitmap_pages = DIV_ROUND_UP(ic->n_bitmap_blocks, PAGE_SIZE / BITMAP_BLOCK_SIZE);
@@ -1043,6 +1102,8 @@ static void complete_journal_io(unsigned long error, void *context)
 	complete_journal_op(comp);
 }
 
+// dm_io で ic->journal の内容を書きだす or ic->journal に読み出す
+// bitmap の書き出しにも使われる
 static void rw_journal_sectors(struct dm_integrity_c *ic, int op, int op_flags,
 			       unsigned sector, unsigned n_sectors, struct journal_completion *comp)
 {
@@ -1063,6 +1124,7 @@ static void rw_journal_sectors(struct dm_integrity_c *ic, int op, int op_flags,
 	io_req.bi_op = op;
 	io_req.bi_op_flags = op_flags;
 	io_req.mem.type = DM_IO_PAGE_LIST;
+	// mode == 'J' の場合しか使ってなさそう
 	if (ic->journal_io)
 		io_req.mem.ptr.pl = &ic->journal_io[pl_index];
 	else
@@ -1206,6 +1268,7 @@ static bool ranges_overlap(struct dm_integrity_range *range1, struct dm_integrit
 	       range1->logical_sector + range1->n_sectors > range2->logical_sector;
 }
 
+// remove_range_unlocked() と add_new_range_and_wait() と dm_integrity_map_continue() から呼ばれる
 static bool add_new_range(struct dm_integrity_c *ic, struct dm_integrity_range *new_range, bool check_waiting)
 {
 	struct rb_node **n = &ic->in_progress.rb_node;
@@ -1242,6 +1305,8 @@ static bool add_new_range(struct dm_integrity_c *ic, struct dm_integrity_range *
 	return true;
 }
 
+// ic->endio_wait.lock のスピンロックを呼び出し側で正しく扱える人向けの remove_range
+// remove_range() と dm_integrity_map_continue と bitmap_flush_work() と integrity_recalc() から呼ばれる
 static void remove_range_unlocked(struct dm_integrity_c *ic, struct dm_integrity_range *range)
 {
 	rb_erase(&range->node, &ic->in_progress);
@@ -1261,6 +1326,8 @@ static void remove_range_unlocked(struct dm_integrity_c *ic, struct dm_integrity
 	}
 }
 
+// ic->endio_wait.lock のスピンロックを取ってから remove_range_unlocked() を呼ぶ
+// dec_in_flight() と integrity_recalc() と bitmap_block_work() から呼ばれる
 static void remove_range(struct dm_integrity_c *ic, struct dm_integrity_range *range)
 {
 	unsigned long flags;
@@ -1270,6 +1337,7 @@ static void remove_range(struct dm_integrity_c *ic, struct dm_integrity_range *r
 	spin_unlock_irqrestore(&ic->endio_wait.lock, flags);
 }
 
+// add_new_range_and_wait() と dm_integrity_map_continue() からしか呼ばれない
 static void wait_and_add_new_range(struct dm_integrity_c *ic, struct dm_integrity_range *new_range)
 {
 	new_range->waiting = true;
@@ -1283,6 +1351,7 @@ static void wait_and_add_new_range(struct dm_integrity_c *ic, struct dm_integrit
 	} while (unlikely(new_range->waiting));
 }
 
+// bitmap mode では bitmap_flush_work() と integrity_recalc() からしか呼ばれない
 static void add_new_range_and_wait(struct dm_integrity_c *ic, struct dm_integrity_range *new_range)
 {
 	if (unlikely(!add_new_range(ic, new_range, true)))
@@ -1402,6 +1471,7 @@ static bool find_newer_committed_node(struct dm_integrity_c *ic, struct journal_
 #define TAG_WRITE	1
 #define TAG_CMP		2
 
+// チェックサムをディスクに読み書きする。
 static int dm_integrity_rw_tag(struct dm_integrity_c *ic, unsigned char *tag, sector_t *metadata_block,
 			       unsigned *metadata_offset, unsigned total_size, int op)
 {
@@ -1420,15 +1490,18 @@ static int dm_integrity_rw_tag(struct dm_integrity_c *ic, unsigned char *tag, se
 		if (unlikely(r))
 			return r;
 
+		// ディスクに書かれているチェックサムを読み取る
 		data = dm_bufio_read(ic->bufio, *metadata_block, &b);
 		if (IS_ERR(data))
 			return PTR_ERR(data);
 
+		// 512*buffer_sectors
 		to_copy = min((1U << SECTOR_SHIFT << ic->log2_buffer_sectors) - *metadata_offset, total_size);
 		dp = data + *metadata_offset;
 		if (op == TAG_READ) {
 			memcpy(tag, dp, to_copy);
 		} else if (op == TAG_WRITE) {
+			// ディスクに書かれている値と書こうとしている値が違ったら非同期書き込み
 			if (memcmp(dp, tag, to_copy)) {
 				memcpy(dp, tag, to_copy);
 				dm_bufio_mark_partial_buffer_dirty(b, *metadata_offset, *metadata_offset + to_copy);
@@ -1468,6 +1541,7 @@ thorough_test:
 
 		tag += to_copy;
 		*metadata_offset += to_copy;
+		// ブロックをはみ出してしまった場合は次のブロックに移る
 		if (unlikely(*metadata_offset == 1U << SECTOR_SHIFT << ic->log2_buffer_sectors)) {
 			(*metadata_block)++;
 			*metadata_offset = 0;
@@ -1500,6 +1574,8 @@ static void flush_notify(unsigned long error, void *fr_)
 	complete(&fr->comp);
 }
 
+// ic->bufio のダーティバッファを書き出す
+// flush_data が true なら I/O が終わるのを待つ
 static void dm_integrity_flush_buffers(struct dm_integrity_c *ic, bool flush_data)
 {
 	int r;
@@ -1521,6 +1597,8 @@ static void dm_integrity_flush_buffers(struct dm_integrity_c *ic, bool flush_dat
 		fr.io_reg.count = 0,
 		fr.ic = ic;
 		init_completion(&fr.comp);
+		// dm_io は IO を発行するくらいの意味
+		// https://www.akiradeveloper.com/post/device-mapper-io-submit/
 		r = dm_io(&fr.io_req, 1, &fr.io_reg, NULL);
 		BUG_ON(r);
 	}
@@ -1549,7 +1627,7 @@ static void autocommit_fn(struct timer_list *t)
 	struct dm_integrity_c *ic = from_timer(ic, t, autocommit_timer);
 
 	if (likely(!dm_integrity_failed(ic)))
-		queue_work(ic->commit_wq, &ic->commit_work);
+		queue_work(ic->commit_wq, &ic->commit_work); // integrity_commit() を呼ぶ
 }
 
 static void schedule_autocommit(struct dm_integrity_c *ic)
@@ -1558,6 +1636,8 @@ static void schedule_autocommit(struct dm_integrity_c *ic)
 		mod_timer(&ic->autocommit_timer, jiffies + ic->autocommit_jiffies);
 }
 
+// dm_integrity_map で bio に REQ_PREFLUSH が付いていた場合と do_endio_flush で呼ばれる
+// ic->flush_bio_list に bio を追加して integrity_commit() を呼ぶ
 static void submit_flush_bio(struct dm_integrity_c *ic, struct dm_integrity_io *dio)
 {
 	struct bio *bio;
@@ -1568,9 +1648,12 @@ static void submit_flush_bio(struct dm_integrity_c *ic, struct dm_integrity_io *
 	bio_list_add(&ic->flush_bio_list, bio);
 	spin_unlock_irqrestore(&ic->endio_wait.lock, flags);
 
+	// integrity_commit() を呼ぶ
 	queue_work(ic->commit_wq, &ic->commit_work);
 }
 
+// 基本的には bio_endio を呼ぶだけ
+// resume したときに遷移する synchronous_mode なるものの場合は代わりに bio を ic->synchronous_bios に追加して bitmap_flush_work()
 static void do_endio(struct dm_integrity_c *ic, struct bio *bio)
 {
 	int r = dm_integrity_failed(ic);
@@ -1591,6 +1674,8 @@ static void do_endio_flush(struct dm_integrity_c *ic, struct dm_integrity_io *di
 {
 	struct bio *bio = dm_bio_from_per_bio_data(dio, sizeof(struct dm_integrity_io));
 
+	// dio->op == REQ_OP_WRITE && bio->bi_opf & REQ_FUA のときは
+	// ic->flush_bio_list に bio を追加して integrity_commit() を呼ぶ
 	if (unlikely(dio->fua) && likely(!bio->bi_status) && likely(!dm_integrity_failed(ic)))
 		submit_flush_bio(ic, dio);
 	else
@@ -1599,6 +1684,8 @@ static void do_endio_flush(struct dm_integrity_c *ic, struct dm_integrity_io *di
 
 static void dec_in_flight(struct dm_integrity_io *dio)
 {
+	// * Atomically decrements @v by 1 and
+ 	// * returns true if the result is 0, or false for all other
 	if (atomic_dec_and_test(&dio->in_flight)) {
 		struct dm_integrity_c *ic = dio->ic;
 		struct bio *bio;
@@ -1611,10 +1698,11 @@ static void dec_in_flight(struct dm_integrity_io *dio)
 		bio = dm_bio_from_per_bio_data(dio, sizeof(struct dm_integrity_io));
 
 		if (unlikely(dio->bi_status) && !bio->bi_status)
-			bio->bi_status = dio->bi_status;
+			bio->bi_status = dio->bi_status; // エラーを dio から bio に伝播
 		if (likely(!bio->bi_status) && unlikely(bio_sectors(bio) != dio->range.n_sectors)) {
 			dio->range.logical_sector += dio->range.n_sectors;
 			bio_advance(bio, dio->range.n_sectors << SECTOR_SHIFT);
+			// dm_integrity_map_continue に戻る
 			INIT_WORK(&dio->work, integrity_bio_wait);
 			queue_work(ic->offload_wq, &dio->work);
 			return;
@@ -1637,6 +1725,8 @@ static void integrity_end_io(struct bio *bio)
 	dec_in_flight(dio);
 }
 
+// data のチェックサムを計算して result に書いて返す
+// セクタの位置も計算に含める（そうしないと HMAC のときにセクタの中身をシャッフルするような攻撃が可能）
 static void integrity_sector_checksum(struct dm_integrity_c *ic, sector_t sector,
 				      const char *data, char *result)
 {
@@ -1690,6 +1780,9 @@ failed:
 	get_random_bytes(result, ic->tag_size);
 }
 
+// 書き込みのとき：ページキャッシュに乗せられているデータのチェックサムを計算してから dm_integrity_rw_tag に投げてディスクに書きこむ。dm_integrity_map_continue で bitmap を書き込んだあとで呼ばれる。
+// 読み込みのとき：ページキャッシュに乗せられているデータのチェックサムを計算してから dm_integrity_rw_tag に投げてディスクに書かれているチェックサムとの一致を確かめる。dm_integrity_map_continue でデータを読み込んでページキャッシュに乗せた後で呼ばれる。
+// bitmap の FLUSH はしていないかったかも？ → この関数の中では FLUSH を待つような処理は書いてなさそうだったのでたぶん FLUSH 済みなんだろう
 static void integrity_metadata(struct work_struct *w)
 {
 	struct dm_integrity_io *dio = container_of(w, struct dm_integrity_io, work);
@@ -1769,6 +1862,7 @@ again:
 			pos = 0;
 			checksums_ptr = checksums;
 			do {
+				// REQ_OP_READ の場合は read_comp により読み込みを待機しているので既にページキャッシュに載っている
 				integrity_sector_checksum(ic, sector, mem + pos, checksums_ptr);
 				checksums_ptr += ic->tag_size;
 				sectors_to_process -= ic->sectors_per_block;
@@ -1805,6 +1899,7 @@ again:
 		if (likely(checksums != checksums_onstack))
 			kfree(checksums);
 	} else {
+		// ic->internal_hash == NULL
 		struct bio_integrity_payload *bip = dio->bio_details.bi_integrity;
 
 		if (bip) {
@@ -1865,6 +1960,7 @@ static int dm_integrity_map(struct dm_target *ti, struct bio *bio)
 	}
 
 	if (unlikely(bio->bi_opf & REQ_PREFLUSH)) {
+		// ic->flush_bio_list に bio を追加して integrity_commit() を呼ぶ
 		submit_flush_bio(ic, dio);
 		return DM_MAPIO_SUBMITTED;
 	}
@@ -1903,6 +1999,8 @@ static int dm_integrity_map(struct dm_target *ti, struct bio *bio)
 		}
 	}
 
+	// data-integrity.rst によると SCSI や SATA の拡張フォーマットとしてチェックサムを付与できるものがあり
+	// デバイス側で write 時にチェックしたりできるらしい
 	bip = bio_integrity(bio);
 	if (!ic->internal_hash) {
 		if (bip) {
@@ -1924,11 +2022,14 @@ static int dm_integrity_map(struct dm_target *ti, struct bio *bio)
 		}
 	}
 
+	// recovery mode で READ 以外の操作が来たらエラー
 	if (unlikely(ic->mode == 'R') && unlikely(dio->op != REQ_OP_READ))
 		return DM_MAPIO_KILL;
 
 	get_area_and_offset(ic, dio->range.logical_sector, &area, &offset);
+	// チェックサムが書かれるセクタとオフセットを得る
 	dio->metadata_block = get_metadata_sector_and_offset(ic, area, offset, &dio->metadata_offset);
+	// データがかかれるセクタを得る
 	bio->bi_iter.bi_sector = get_data_sector(ic, area, offset);
 
 	dm_integrity_map_continue(dio, true);
@@ -2066,6 +2167,7 @@ retry_kmap:
 		if (unlikely(waitqueue_active(&ic->copy_to_journal_wait)))
 			wake_up(&ic->copy_to_journal_wait);
 		if (READ_ONCE(ic->free_sectors) <= ic->free_sectors_threshold) {
+			// integrity_commit() を呼ぶ
 			queue_work(ic->commit_wq, &ic->commit_work);
 		} else {
 			schedule_autocommit(ic);
@@ -2086,6 +2188,7 @@ retry_kmap:
 	return false;
 }
 
+// from_map は integrity_bio_wait から来た時に false になる
 static void dm_integrity_map_continue(struct dm_integrity_io *dio, bool from_map)
 {
 	struct dm_integrity_c *ic = dio->ic;
@@ -2099,6 +2202,8 @@ static void dm_integrity_map_continue(struct dm_integrity_io *dio, bool from_map
 		need_sync_io = true;
 
 	if (need_sync_io && from_map) {
+		// integrity_bio_wait では結局 dm_integrity_map_continue (dio, from_map=false) に戻ってくる。
+		// offload_wq で同期処理が既に積んであるはずなのでそれが終わるのを待てばいいということか？
 		INIT_WORK(&dio->work, integrity_bio_wait);
 		queue_work(ic->offload_wq, &dio->work);
 		return;
@@ -2180,6 +2285,7 @@ retry:
 			}
 		}
 	}
+	// この range ってやつの true/false が何を表しているのか分からないんだよなー
 	if (unlikely(!add_new_range(ic, &dio->range, true))) {
 		/*
 		 * We must not sleep in the request routine because it could
@@ -2233,7 +2339,9 @@ offload_to_thread:
 		goto journal_read_write;
 	}
 
+	// ようやく mode == 'J' の場合を抜けたぜ
 	if (ic->mode == 'B' && (dio->op == REQ_OP_WRITE || unlikely(dio->op == REQ_OP_DISCARD))) {
+		// SET されていなかったら SET する
 		if (!block_bitmap_op(ic, ic->may_write_bitmap, dio->range.logical_sector,
 				     dio->range.n_sectors, BITMAP_OP_TEST_ALL_SET)) {
 			struct bitmap_block_status *bbs;
@@ -2242,7 +2350,9 @@ offload_to_thread:
 			spin_lock(&bbs->bio_queue_lock);
 			bio_list_add(&bbs->bio_queue, bio);
 			spin_unlock(&bbs->bio_queue_lock);
+			// bbs に割り当てられているのは bitmap_block_work
 			queue_work(ic->writer_wq, &bbs->work);
+			// bitmap_block_work から dm_integrity_map_continue(dio, from_map=false) で戻ってくる
 			return;
 		}
 	}
@@ -2274,6 +2384,7 @@ offload_to_thread:
 		return;
 	}
 
+	// ここでデータ本体を書き込む。たぶん…
 	submit_bio_noacct(bio);
 
 	if (need_sync_io) {
@@ -2281,19 +2392,23 @@ offload_to_thread:
 		if (ic->sb->flags & cpu_to_le32(SB_FLAG_RECALCULATING) &&
 		    dio->range.logical_sector + dio->range.n_sectors > le64_to_cpu(ic->sb->recalc_sector))
 			goto skip_check;
+		// 対応する bitmap に SET の箇所が一つでもあればチェックサムの一致判定をスキップする
 		if (ic->mode == 'B') {
 			if (!block_bitmap_op(ic, ic->recalc_bitmap, dio->range.logical_sector,
 					     dio->range.n_sectors, BITMAP_OP_TEST_ALL_CLEAR))
 				goto skip_check;
 		}
 
+		// submit_bio_noacct() でページキャッシュに乗せたデータのチェックサムとディスクに書かれているチェックサムが一致するか判定する
 		if (likely(!bio->bi_status))
 			integrity_metadata(&dio->work);
 		else
 skip_check:
+			// integrity_metadata の最期で dec_in_flight している代わりをやる
 			dec_in_flight(dio);
 
 	} else {
+		// submit_bio_noacct() でページキャッシュに乗せたデータのチェックサムをディスクに書きこむ
 		INIT_WORK(&dio->work, integrity_metadata);
 		queue_work(ic->metadata_wq, &dio->work);
 	}
@@ -2336,6 +2451,8 @@ static void pad_uncommitted(struct dm_integrity_c *ic)
 	}
 }
 
+// dm_integrity_flush_buffers で ic->bufio のダーティバッファを書き出してから
+// ic->flush_bio_list の各 bio に対して do_endio を呼ぶ
 static void integrity_commit(struct work_struct *w)
 {
 	struct dm_integrity_c *ic = container_of(w, struct dm_integrity_c, commit_work);
@@ -2343,15 +2460,22 @@ static void integrity_commit(struct work_struct *w)
 	unsigned i, j, n;
 	struct bio *flushes;
 
+	// integrity_commit 実行中に定期実行により integrity_commit が実行されるのを止めたいっぽい。
+	// 最期のほうで dec_in_flight で戻してそう
 	del_timer(&ic->autocommit_timer);
 
 	spin_lock_irq(&ic->endio_wait.lock);
+	// submit_flush_bio で add していたやつ
 	flushes = bio_list_get(&ic->flush_bio_list);
+	// ic->mode == 'B' ならこっち
 	if (unlikely(ic->mode != 'J')) {
 		spin_unlock_irq(&ic->endio_wait.lock);
 		dm_integrity_flush_buffers(ic, true);
 		goto release_flush_bios;
 	}
+
+	// ic->mode == 'J' の場合。どうもジャーナルの flush までやっているっぽい？
+	// もしそうなら遅そう
 
 	pad_uncommitted(ic);
 	commit_start = ic->uncommitted_section;
@@ -2568,6 +2692,7 @@ skip_io:
 	dm_integrity_flush_buffers(ic, true);
 }
 
+// mode == 'J' のときしか呼ばれない
 static void integrity_writer(struct work_struct *w)
 {
 	struct dm_integrity_c *ic = container_of(w, struct dm_integrity_c, writer_work);
@@ -2750,6 +2875,7 @@ unlock_ret:
 	recalc_write_super(ic);
 }
 
+// dm_integrity_map_continue で書こうとした領域に bitmap がセットされていなかったときに呼び出される
 static void bitmap_block_work(struct work_struct *w)
 {
 	struct bitmap_block_status *bbs = container_of(w, struct bitmap_block_status, work);
@@ -2761,6 +2887,8 @@ static void bitmap_block_work(struct work_struct *w)
 	bio_list_init(&waiting);
 
 	spin_lock(&bbs->bio_queue_lock);
+	// 👆ここまでに bbs->bio_queue に追加されていた bio は処理してあげる。
+	// 後続のものは新しく作られた bbs->bio_queue で処理するので次回の処理をお楽しみに
 	bio_queue = bbs->bio_queue;
 	bio_list_init(&bbs->bio_queue);
 	spin_unlock(&bbs->bio_queue_lock);
@@ -2772,10 +2900,13 @@ static void bitmap_block_work(struct work_struct *w)
 
 		if (block_bitmap_op(ic, ic->may_write_bitmap, dio->range.logical_sector,
 				    dio->range.n_sectors, BITMAP_OP_TEST_ALL_SET)) {
+			// 既に bitmap に SET されていたら dm_integrity_map_continue に戻る
 			remove_range(ic, &dio->range);
 			INIT_WORK(&dio->work, integrity_bio_wait);
 			queue_work(ic->offload_wq, &dio->work);
 		} else {
+			// 書かれていなかったら ic->journal 側に SET して waiting に追加
+			// may_write_bitmap 側は journal を書き終えてから SET する
 			block_bitmap_op(ic, ic->journal, dio->range.logical_sector,
 					dio->range.n_sectors, BITMAP_OP_SET);
 			bio_list_add(&waiting, bio);
@@ -2792,30 +2923,38 @@ static void bitmap_block_work(struct work_struct *w)
 	while ((bio = bio_list_pop(&waiting))) {
 		struct dm_integrity_io *dio = dm_per_bio_data(bio, sizeof(struct dm_integrity_io));
 
+		// 書き終わったら may_write_bitmap 側を SET する
 		block_bitmap_op(ic, ic->may_write_bitmap, dio->range.logical_sector,
 				dio->range.n_sectors, BITMAP_OP_SET);
 
 		remove_range(ic, &dio->range);
+		// dm_integrity_map_continue を継続する
+		// 既に bitmap が SET されていたものに関しては👆のほうで dm_integrity_map_continue に戻されている
 		INIT_WORK(&dio->work, integrity_bio_wait);
 		queue_work(ic->offload_wq, &dio->work);
 	}
 
+	// あとで bitmap_flush_work() を呼んでデータ領域をフラッシュした後に bitmap を CLEAR しておいてね
 	queue_delayed_work(ic->commit_wq, &ic->bitmap_flush_work, ic->bitmap_flush_interval);
 }
 
+// データ領域の（？）flush をしたあとで bitmap を CLEAR する
 static void bitmap_flush_work(struct work_struct *work)
 {
 	struct dm_integrity_c *ic = container_of(work, struct dm_integrity_c, bitmap_flush_work.work);
 	struct dm_integrity_range range;
 	unsigned long limit;
 	struct bio *bio;
-
+	
 	dm_integrity_flush_buffers(ic, false);
 
 	range.logical_sector = 0;
 	range.n_sectors = ic->provided_data_sectors;
 
 	spin_lock_irq(&ic->endio_wait.lock);
+	// 謎
+	// たぶん bitmap が SET された領域 & 対応する tag の書き出しが終わるのを待っている
+	// （待たずに CLEAR してはいけないので）
 	add_new_range_and_wait(ic, &range);
 	spin_unlock_irq(&ic->endio_wait.lock);
 
@@ -3081,7 +3220,9 @@ static void dm_integrity_postsuspend(struct dm_target *ti)
 	if (ic->mode == 'B')
 		cancel_delayed_work_sync(&ic->bitmap_flush_work);
 
+	// integrity_commit() を呼ぶ
 	queue_work(ic->commit_wq, &ic->commit_work);
+	// flush_workqueue との違いが man を読んでも分からない
 	drain_workqueue(ic->commit_wq);
 
 	if (ic->mode == 'J') {
@@ -3117,13 +3258,16 @@ static void dm_integrity_resume(struct dm_target *ti)
 	DEBUG_print("resume\n");
 
 	if (ic->provided_data_sectors != old_provided_data_sectors) {
+		// ボリュームサイズが増えた場合はその箇所は bitmap を SET しておく。チェックサムと一致するわけがないので
 		if (ic->provided_data_sectors > old_provided_data_sectors &&
 		    ic->mode == 'B' &&
 		    ic->sb->log2_blocks_per_bitmap_bit == ic->log2_blocks_per_bitmap_bit) {
+			// ic->journal にビットマップを乗せる
 			rw_journal_sectors(ic, REQ_OP_READ, 0, 0,
 					   ic->n_bitmap_blocks * (BITMAP_BLOCK_SIZE >> SECTOR_SHIFT), NULL);
 			block_bitmap_op(ic, ic->journal, old_provided_data_sectors,
 					ic->provided_data_sectors - old_provided_data_sectors, BITMAP_OP_SET);
+			// ここの write はどうして必要なのだろう
 			rw_journal_sectors(ic, REQ_OP_WRITE, REQ_FUA | REQ_SYNC, 0,
 					   ic->n_bitmap_blocks * (BITMAP_BLOCK_SIZE >> SECTOR_SHIFT), NULL);
 		}
@@ -3373,11 +3517,16 @@ static void calculate_journal_section_size(struct dm_integrity_c *ic)
 	ic->journal_entries = ic->journal_section_entries * ic->journal_sections;
 }
 
+// 成功したら 0
 static int calculate_device_limits(struct dm_integrity_c *ic)
 {
 	__u64 initial_sectors;
 
 	calculate_journal_section_size(ic);
+	// ここでチェックサムの書き始めの位置が決まる
+	// ic->journal_section_sectors = (ic->journal_section_entries << ic->sb->log2_sectors_per_block) + JOURNAL_BLOCK_SECTORS
+	// ic->journal_sections = le32_to_cpu(ic->sb->journal_sections)
+	//                      = 
 	initial_sectors = SB_SECTORS + (__u64)ic->journal_section_sectors * ic->journal_sections;
 	if (initial_sectors + METADATA_PADDING_SECTORS >= ic->meta_device_sectors || initial_sectors > UINT_MAX)
 		return -EINVAL;
@@ -3404,10 +3553,14 @@ static int calculate_device_limits(struct dm_integrity_c *ic)
 		if (last_sector < ic->start || last_sector >= ic->meta_device_sectors)
 			return -EINVAL;
 	} else {
+		// タグの数 * タグサイズ
 		__u64 meta_size = (ic->provided_data_sectors >> ic->sb->log2_sectors_per_block) * ic->tag_size;
+		// (a+b-1)/b で ceil(meta_size / buffer_size) * buffer_size して buffer_size の倍数になるまで meta_size を伸ばす
 		meta_size = (meta_size + ((1U << (ic->log2_buffer_sectors + SECTOR_SHIFT)) - 1))
 				>> (ic->log2_buffer_sectors + SECTOR_SHIFT);
 		meta_size <<= ic->log2_buffer_sectors;
+		// 前半はオーバーフロー検知
+		// 後半は meta_dev の容量を超えていたらエラーにするため
 		if (ic->initial_sectors + meta_size < ic->initial_sectors ||
 		    ic->initial_sectors + meta_size > ic->meta_device_sectors)
 			return -EINVAL;
@@ -3432,6 +3585,8 @@ static void get_provided_data_sectors(struct dm_integrity_c *ic)
 		}
 	} else {
 		ic->provided_data_sectors = ic->data_device_sectors;
+		// sectors_per_block が二冪であることが保証されている
+		// はみ出た分は捨てる
 		ic->provided_data_sectors &= ~(sector_t)(ic->sectors_per_block - 1);
 	}
 }
@@ -3480,12 +3635,14 @@ static int initialize_superblock(struct dm_integrity_c *ic, unsigned journal_sec
 
 try_smaller_buffer:
 		ic->sb->journal_sections = cpu_to_le32(0);
+		// もしかしてこれ二分探索か？
 		for (test_bit = fls(journal_sections) - 1; test_bit >= 0; test_bit--) {
 			__u32 prev_journal_sections = le32_to_cpu(ic->sb->journal_sections);
 			__u32 test_journal_sections = prev_journal_sections | (1U << test_bit);
 			if (test_journal_sections > journal_sections)
 				continue;
 			ic->sb->journal_sections = cpu_to_le32(test_journal_sections);
+			// 失敗したら prev_journal_sections に戻す
 			if (calculate_device_limits(ic))
 				ic->sb->journal_sections = cpu_to_le32(prev_journal_sections);
 
@@ -4230,6 +4387,7 @@ static int dm_integrity_ctr(struct dm_target *ti, unsigned argc, char **argv)
 			r = -ENOMEM;
 			goto bad;
 		}
+		// 呼ばれるのは mode == 'J' のときだけ
 		INIT_WORK(&ic->writer_work, integrity_writer);
 	}
 
@@ -4248,6 +4406,9 @@ static int dm_integrity_ctr(struct dm_target *ti, unsigned argc, char **argv)
 	should_write_sb = false;
 	if (memcmp(ic->sb->magic, SB_MAGIC, 8)) {
 		if (ic->mode != 'R') {
+			// memchr_inv は与えられた文字以外を検索する関数
+			// スーパーブロック分の領域がすべて 0 じゃなかったら "The device is not initialized" にする
+			// dd などで消しておかないといけない
 			if (memchr_inv(ic->sb, 0, SB_SECTORS << SECTOR_SHIFT)) {
 				r = -EINVAL;
 				ti->error = "The device is not initialized";
@@ -4325,22 +4486,30 @@ try_smaller_buffer:
 		goto bad;
 	}
 
+	// dmsetup の sectors_per_bit で設定された値の log2 が log2_sectors_per_bitmap_bit になる
 	if (log2_sectors_per_bitmap_bit < 0)
 		log2_sectors_per_bitmap_bit = __fls(DEFAULT_SECTORS_PER_BITMAP_BIT);
+	// ビットマップとチェックサムの対応が 1:N なら許されるが N:1 は許されない
 	if (log2_sectors_per_bitmap_bit < ic->sb->log2_sectors_per_block)
 		log2_sectors_per_bitmap_bit = ic->sb->log2_sectors_per_block;
 
+	// (__u64)ic->journal_section_sectors * ic->journal_sections はビットマップ用に確保されている領域のセクタ数
+	// calculate_device_limits() 参照
+	// SECTOR_SHIFT + 3 の +3 はビット数ということか
 	bits_in_journal = ((__u64)ic->journal_section_sectors * ic->journal_sections) << (SECTOR_SHIFT + 3);
 	if (bits_in_journal > UINT_MAX)
 		bits_in_journal = UINT_MAX;
+	// データ領域のサイズに対して必要なビットマップ領域の大きさが、与えられたディスクサイズに収まるように sectors_per_bit を大きくしていく
 	while (bits_in_journal < (ic->provided_data_sectors + ((sector_t)1 << log2_sectors_per_bitmap_bit) - 1) >> log2_sectors_per_bitmap_bit)
 		log2_sectors_per_bitmap_bit++;
 
+	// log なので引き算は割り算
 	log2_blocks_per_bitmap_bit = log2_sectors_per_bitmap_bit - ic->sb->log2_sectors_per_block;
 	ic->log2_blocks_per_bitmap_bit = log2_blocks_per_bitmap_bit;
 	if (should_write_sb) {
 		ic->sb->log2_blocks_per_bitmap_bit = log2_blocks_per_bitmap_bit;
 	}
+	// (a+b-1)/b
 	n_bitmap_bits = ((ic->provided_data_sectors >> ic->sb->log2_sectors_per_block)
 				+ (((sector_t)1 << log2_blocks_per_bitmap_bit) - 1)) >> log2_blocks_per_bitmap_bit;
 	ic->n_bitmap_blocks = DIV_ROUND_UP(n_bitmap_bits, BITMAP_BLOCK_SIZE * 8);
@@ -4422,6 +4591,7 @@ try_smaller_buffer:
 		goto bad;
 	}
 
+	// dmsetup で与えた buffer_sectors が引数の block_size として与えられる
 	ic->bufio = dm_bufio_client_create(ic->meta_dev ? ic->meta_dev->bdev : ic->dev->bdev,
 			1U << (SECTOR_SHIFT + ic->log2_buffer_sectors), 1, 0, NULL, NULL);
 	if (IS_ERR(ic->bufio)) {
@@ -4430,6 +4600,8 @@ try_smaller_buffer:
 		ic->bufio = NULL;
 		goto bad;
 	}
+	// initial_sectors は bitmap のサイズになる（ならないと困る）
+	// tag を書き込むときは ic->bufio に対してオフセットで指定する
 	dm_bufio_set_sector_offset(ic->bufio, ic->start + ic->initial_sectors);
 
 	if (ic->mode != 'R') {
